@@ -1,3 +1,4 @@
+
 local Comm = {}
 
 local Players = game:GetService("Players")
@@ -6,8 +7,11 @@ local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 local PREFIX = "AllyComm_"
+local MAX_MESSAGES = 500
+
 local lastSeen = {}
 local counter = 0
+local sessionId = HttpService:GenerateGUID(false)
 
 local function getFile(userId)
     return PREFIX .. tostring(userId) .. ".txt"
@@ -49,7 +53,7 @@ local function decodeValue(value)
     if value.__type == "Vector3" then
         return Vector3.new(value.x, value.y, value.z)
     elseif value.__type == "CFrame" then
-        return CFrame.new(unpack(value.components))
+        return CFrame.new(table.unpack(value.components))
     end
 
     local result = {}
@@ -61,8 +65,42 @@ local function decodeValue(value)
     return result
 end
 
+local function readQueue(file)
+    if not isfile(file) then
+        return {}
+    end
+
+    local success, data = pcall(function()
+        return HttpService:JSONDecode(readfile(file))
+    end)
+
+    if not success or type(data) ~= "table" then
+        return nil
+    end
+
+    if type(data.messages) == "table" then
+        return data.messages
+    end
+
+    -- Support the old single-message format.
+    if data.senderId and data.command then
+        return { data }
+    end
+
+    return {}
+end
+
 function Comm.Send(targetTeam, command)
-    if type(command) ~= "table" then
+    if type(targetTeam) ~= "string"
+        or type(command) ~= "table" then
+        return false
+    end
+
+    local file = getFile(LocalPlayer.UserId)
+    local queue = readQueue(file)
+
+    if not queue then
+        warn("[Comm] Could not read queue:", file)
         return false
     end
 
@@ -70,17 +108,24 @@ function Comm.Send(targetTeam, command)
 
     local packet = {
         id = counter,
+        sessionId = sessionId,
         senderId = LocalPlayer.UserId,
         senderTeam = LocalPlayer.TeamColor.Name,
         targetTeam = targetTeam,
         command = encodeValue(command)
     }
 
+    table.insert(queue, packet)
+
+    -- Limit file growth.
+    while #queue > MAX_MESSAGES do
+        table.remove(queue, 1)
+    end
+
     local success, err = pcall(function()
-        writefile(
-            getFile(LocalPlayer.UserId),
-            HttpService:JSONEncode(packet)
-        )
+        writefile(file, HttpService:JSONEncode({
+            messages = queue
+        }))
     end)
 
     if not success then
@@ -99,37 +144,56 @@ function Comm.Receive()
         end
 
         local file = getFile(player.UserId)
+        local queue = readQueue(file)
 
-        if not isfile(file) then
+        if not queue then
             continue
         end
 
-        local success, packet = pcall(function()
-            return HttpService:JSONDecode(readfile(file))
-        end)
+        for _, packet in ipairs(queue) do
+            if type(packet) ~= "table" then
+                continue
+            end
 
-        if not success or type(packet) ~= "table" then
-            continue
+            if packet.senderId ~= player.UserId then
+                continue
+            end
+
+            if packet.targetTeam ~= LocalPlayer.TeamColor.Name then
+                continue
+            end
+
+            local packetSession = packet.sessionId or "legacy"
+            local packetId = tonumber(packet.id)
+
+            if not packetId then
+                continue
+            end
+
+            local seenKey = tostring(player.UserId)
+                .. ":" .. packetSession
+
+            local previousId = lastSeen[seenKey] or 0
+
+            if packetId <= previousId then
+                continue
+            end
+
+            local success, decoded = pcall(function()
+                return decodeValue(packet.command)
+            end)
+
+            if success and type(decoded) == "table" then
+                lastSeen[seenKey] = packetId
+
+                table.insert(messages, {
+                    sender = player,
+                    command = decoded
+                })
+            else
+                warn("[Comm] Could not decode message:", packetId)
+            end
         end
-
-        if packet.senderId ~= player.UserId then
-            continue
-        end
-
-        if packet.targetTeam ~= LocalPlayer.TeamColor.Name then
-            continue
-        end
-
-        if packet.id == lastSeen[player.UserId] then
-            continue
-        end
-
-        lastSeen[player.UserId] = packet.id
-
-        table.insert(messages, {
-            sender = player,
-            command = decodeValue(packet.command)
-        })
     end
 
     return messages

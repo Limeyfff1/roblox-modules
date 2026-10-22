@@ -7,6 +7,7 @@ local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 local PREFIX = "AllyComm_"
+local MESSAGE_LIFETIME = 5
 local MAX_MESSAGES = 500
 
 local lastSeen = {}
@@ -17,6 +18,11 @@ local function getFile(userId)
     return PREFIX .. tostring(userId) .. ".txt"
 end
 
+local function getTime()
+    return DateTime.now().UnixTimestampMillis
+end
+
+-- Convert Roblox datatypes into JSON-compatible values
 local function encodeValue(value)
     local kind = typeof(value)
 
@@ -27,11 +33,13 @@ local function encodeValue(value)
             y = value.Y,
             z = value.Z
         }
+
     elseif kind == "CFrame" then
         return {
             __type = "CFrame",
             components = { value:GetComponents() }
         }
+
     elseif kind == "table" then
         local result = {}
 
@@ -45,6 +53,7 @@ local function encodeValue(value)
     return value
 end
 
+-- Restore Roblox datatypes after reading JSON
 local function decodeValue(value)
     if type(value) ~= "table" then
         return value
@@ -52,6 +61,7 @@ local function decodeValue(value)
 
     if value.__type == "Vector3" then
         return Vector3.new(value.x, value.y, value.z)
+
     elseif value.__type == "CFrame" then
         return CFrame.new(table.unpack(value.components))
     end
@@ -65,6 +75,7 @@ local function decodeValue(value)
     return result
 end
 
+-- Read a sender's queue
 local function readQueue(file)
     if not isfile(file) then
         return {}
@@ -82,7 +93,7 @@ local function readQueue(file)
         return data.messages
     end
 
-    -- Support the old single-message format.
+    -- Compatibility with the original single-message format
     if data.senderId and data.command then
         return { data }
     end
@@ -90,6 +101,33 @@ local function readQueue(file)
     return {}
 end
 
+-- Check whether a packet has expired
+local function isExpired(packet)
+    if type(packet) ~= "table" then
+        return true
+    end
+
+    if type(packet.timestamp) ~= "number" then
+        return true
+    end
+
+    local age = getTime() - packet.timestamp
+
+    return age >= MESSAGE_LIFETIME * 1000
+end
+
+-- Remove expired packets from a queue
+local function removeExpired(queue)
+    for i = #queue, 1, -1 do
+        if isExpired(queue[i]) then
+            table.remove(queue, i)
+        end
+    end
+
+    return queue
+end
+
+-- Send a command to an allied team
 function Comm.Send(targetTeam, command)
     if type(targetTeam) ~= "string"
         or type(command) ~= "table" then
@@ -97,6 +135,7 @@ function Comm.Send(targetTeam, command)
     end
 
     local file = getFile(LocalPlayer.UserId)
+
     local queue = readQueue(file)
 
     if not queue then
@@ -104,11 +143,15 @@ function Comm.Send(targetTeam, command)
         return false
     end
 
+    -- Clean up old messages before adding a new one
+    removeExpired(queue)
+
     counter += 1
 
     local packet = {
         id = counter,
         sessionId = sessionId,
+        timestamp = getTime(),
         senderId = LocalPlayer.UserId,
         senderTeam = LocalPlayer.TeamColor.Name,
         targetTeam = targetTeam,
@@ -117,7 +160,7 @@ function Comm.Send(targetTeam, command)
 
     table.insert(queue, packet)
 
-    -- Limit file growth.
+    -- Prevent the file from growing too large
     while #queue > MAX_MESSAGES do
         table.remove(queue, 1)
     end
@@ -135,6 +178,7 @@ function Comm.Send(targetTeam, command)
     return success
 end
 
+-- Receive every new, unexpired command for your team
 function Comm.Receive()
     local messages = {}
 
@@ -155,10 +199,17 @@ function Comm.Receive()
                 continue
             end
 
+            -- Ignore expired commands
+            if isExpired(packet) then
+                continue
+            end
+
+            -- Verify the sender matches the file owner
             if packet.senderId ~= player.UserId then
                 continue
             end
 
+            -- Only receive commands addressed to your team
             if packet.targetTeam ~= LocalPlayer.TeamColor.Name then
                 continue
             end
@@ -175,6 +226,7 @@ function Comm.Receive()
 
             local previousId = lastSeen[seenKey] or 0
 
+            -- Skip commands already received
             if packetId <= previousId then
                 continue
             end
@@ -183,20 +235,62 @@ function Comm.Receive()
                 return decodeValue(packet.command)
             end)
 
-            if success and type(decoded) == "table" then
-                lastSeen[seenKey] = packetId
-
-                table.insert(messages, {
-                    sender = player,
-                    command = decoded
-                })
-            else
-                warn("[Comm] Could not decode message:", packetId)
+            if not success or type(decoded) ~= "table" then
+                warn("[Comm] Failed to decode packet:", packetId)
+                continue
             end
+
+            lastSeen[seenKey] = packetId
+
+            table.insert(messages, {
+                sender = player,
+                command = decoded
+            })
         end
     end
 
     return messages
 end
+
+-- Periodically clean up this client's own queue,
+-- even when no new commands are being sent
+function Comm.Cleanup()
+    local file = getFile(LocalPlayer.UserId)
+
+    if not isfile(file) then
+        return
+    end
+
+    local queue = readQueue(file)
+
+    if not queue then
+        return
+    end
+
+    local previousCount = #queue
+
+    removeExpired(queue)
+
+    if #queue == previousCount then
+        return
+    end
+
+    local success, err = pcall(function()
+        writefile(file, HttpService:JSONEncode({
+            messages = queue
+        }))
+    end)
+
+    if not success then
+        warn("[Comm] Cleanup failed:", err)
+    end
+end
+
+-- Automatically clean up expired messages
+task.spawn(function()
+    while task.wait(1) do
+        Comm.Cleanup()
+    end
+end)
 
 return Comm
